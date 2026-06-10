@@ -61,6 +61,12 @@ if current_platform.is_cuda():
         build_sampling_params_logprob,
         naive_update_model_status,
     )
+else:
+    from fastdeploy.model_executor.ops.xpu import (
+        build_sampling_params,
+        top_p_candidates,
+        verify_draft_tokens,
+    )
 
 
 def _apply_triton_top_k_top_p(
@@ -927,7 +933,6 @@ class SpeculativeSampler(nn.Layer):
         increment_value: int,
         accept_all_drafts: bool = False,
         reject_all_drafts: bool = False,
-        topp_seed: Optional[paddle.Tensor] = None,
     ) -> SamplerOutput:
         """
         Verify draft tokens against target model output and produce final samples.
@@ -960,7 +965,7 @@ class SpeculativeSampler(nn.Layer):
 
         if self.verify_strategy == VerifyStrategy.TARGET_MATCH:
             if FD_SAMPLING_CLASS.lower() == "triton":
-                target_tokens = _random_sample(probs, topp_seed=topp_seed)
+                target_tokens = _random_sample(probs, topp_seed=sampling_metadata.seed)
             else:
                 # Only TARGET_MATCH needs stochastic sampling
                 top_p, top_k, topp_seed = build_sampling_params(
@@ -1039,7 +1044,6 @@ class SpeculativeSampler(nn.Layer):
         probs: paddle.Tensor,
         sampling_metadata: SamplingMetadata,
         share_inputs: List[paddle.Tensor],
-        topp_seed: Optional[paddle.Tensor],
     ) -> SamplerOutput:
         """
         Normal sampling without draft token verification.
@@ -1062,7 +1066,7 @@ class SpeculativeSampler(nn.Layer):
 
         # Sample tokens
         if FD_SAMPLING_CLASS.lower() == "triton":
-            next_tokens = _random_sample(probs, topp_seed=topp_seed)
+            next_tokens = _random_sample(probs, topp_seed=sampling_metadata.seed)
         else:
             next_tokens = _sample_from_probs(
                 probs,
@@ -1166,7 +1170,6 @@ class SpeculativeSampler(nn.Layer):
             )
 
         logits_ori = None
-        topp_seed = None
         if FD_SAMPLING_CLASS.lower() == "triton":
             logits_ori = logits.clone()
             top_p, top_k, _ = build_sampling_params(
@@ -1190,7 +1193,7 @@ class SpeculativeSampler(nn.Layer):
         # Route based on spec_method
         is_naive = self.spec_method is None or self.spec_method == SpecMethod.NAIVE
         if is_naive:
-            sampler_output = self._normal_sample(logits, probs, sampling_metadata, share_inputs, topp_seed=topp_seed)
+            sampler_output = self._normal_sample(logits, probs, sampling_metadata, share_inputs)
         else:
             sampler_output = self._verify_and_sample(
                 logits,
@@ -1202,7 +1205,6 @@ class SpeculativeSampler(nn.Layer):
                 increment_value,
                 accept_all_drafts,
                 reject_all_drafts,
-                topp_seed=topp_seed,
             )
 
         # Build logprobs via unified path (outside of sampling logic)
@@ -1230,19 +1232,12 @@ class SpeculativeSampler(nn.Layer):
         share_inputs: List[paddle.Tensor],
     ) -> SamplerOutput:
         """Normal sampling for NAIVE mode on XPU."""
-        top_p, top_k, topp_seed = padding_sampling_params(
-            sampling_metadata.top_p,
-            sampling_metadata.top_k,
-            sampling_metadata.seed,
-            paddle.reshape(share_inputs["seq_lens_this_time"], shape=[-1]),
-            paddle.reshape(share_inputs["seq_lens_encoder"], shape=[-1]),
-        )
         _, next_tokens = top_k_top_p_sampling(
             probs,
-            top_p=top_p,
-            top_k=top_k,
+            top_p=sampling_metadata.top_p,
+            top_k=sampling_metadata.top_k,
             top_k_list=sampling_metadata.top_k_list,
-            topp_seed=topp_seed,
+            topp_seed=sampling_metadata.topp_seed,
         )
         real_bsz = share_inputs["seq_lens_this_time"].shape[0]
         running_mask = (paddle.reshape(share_inputs["seq_lens_this_time"], shape=[-1]) > 0).cast("int32")
@@ -1262,25 +1257,24 @@ class SpeculativeSampler(nn.Layer):
         sampling_metadata: SamplingMetadata,
         max_model_len: int,
         share_inputs: List[paddle.Tensor],
+        increment_value: int,
         accept_all_drafts: bool = False,
         reject_all_drafts: bool = False,
     ) -> SamplerOutput:
         """Verify draft tokens (MTP/Ngram mode) on XPU using verify_draft_tokens."""
-        from fastdeploy.model_executor.ops.xpu import (
-            top_p_candidates,
-            verify_draft_tokens,
-        )
 
         target_tokens = None
         candidate_ids, candidate_scores, candidate_lens = None, None, None
 
         if self.verify_strategy == VerifyStrategy.TARGET_MATCH:
-            top_p, top_k, topp_seed = padding_sampling_params(
+            top_p, top_k, topp_seed = build_sampling_params(
                 sampling_metadata.top_p,
                 sampling_metadata.top_k,
                 sampling_metadata.seed,
-                paddle.reshape(share_inputs["seq_lens_this_time"], shape=[-1]),
-                paddle.reshape(share_inputs["seq_lens_encoder"], shape=[-1]),
+                share_inputs["seq_lens_this_time"],
+                share_inputs["seq_lens_encoder"],
+                token_num_output_cpu=int(share_inputs["cu_seqlens_q_output"][-1]),
+                increment_value=increment_value,
             )
             _, target_tokens = top_k_top_p_sampling(
                 probs,
@@ -1342,6 +1336,7 @@ class SpeculativeSampler(nn.Layer):
         sampling_metadata: SamplingMetadata,
         max_model_len: int,
         share_inputs: List[paddle.Tensor],
+        increment_value: int,
         accept_all_drafts: bool = False,
         reject_all_drafts: bool = False,
     ) -> SamplerOutput:
@@ -1395,6 +1390,7 @@ class SpeculativeSampler(nn.Layer):
                 sampling_metadata,
                 max_model_len,
                 share_inputs,
+                increment_value,
                 accept_all_drafts,
                 reject_all_drafts,
             )
